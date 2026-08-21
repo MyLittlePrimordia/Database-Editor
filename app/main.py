@@ -12,8 +12,8 @@ Package as exe with PyInstaller (see README.md).
 import os
 import sys
 import json
-import shutil
 import datetime
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -120,8 +120,19 @@ class IconManager:
             return None
         if name in self.cache:
             return self.cache[name]
-        path = os.path.join(self.dir, "{}.png".format(name))
-        if not os.path.isfile(path):
+        # handle legacy typo: trybrid.png vs tribrid.png
+        candidates = [name]
+        if name == "tribrid":
+            candidates.append("trybrid")
+        elif name == "trybrid":
+            candidates.append("tribrid")
+        path = None
+        for cand in candidates:
+            p = os.path.join(self.dir, "{}.png".format(cand))
+            if os.path.isfile(p):
+                path = p
+                break
+        if not path:
             self.cache[name] = None
             return None
         try:
@@ -545,7 +556,15 @@ class FileLinkerPanel(ttk.Frame):
         self.search_var = tk.StringVar()
         search = ttk.Entry(self, textvariable=self.search_var)
         search.grid(row=2, column=0, sticky="ew", padx=8)
-        self.search_var.trace_add("write", lambda *a: self._refresh_available())
+        self._search_debounce = None
+        def _on_search_change(*a):
+            if self._search_debounce:
+                try:
+                    self.after_cancel(self._search_debounce)
+                except Exception:
+                    pass
+            self._search_debounce = self.after(150, self._refresh_available)
+        self.search_var.trace_add("write", _on_search_change)
 
         avail_frame = ttk.Frame(self, style="Card.TFrame")
         avail_frame.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
@@ -596,6 +615,7 @@ class FileLinkerPanel(ttk.Frame):
 
     def _invalidate_cache(self):
         self._all_files_cache = None
+        self._cache_root = None
         self._refresh_available()
 
     @staticmethod
@@ -624,6 +644,26 @@ class FileLinkerPanel(ttk.Frame):
             return []
         if self._all_files_cache is not None and self._cache_root == root:
             return self._all_files_cache
+        # If user selected the data folder itself, use it directly
+        if os.path.basename(os.path.normpath(root)).lower() == "data" and os.path.isdir(root):
+            data_dir = root
+            base_root = os.path.dirname(root)
+            # need to compute rel against base_root so paths stay data/...
+            results = []
+            for r, _, files in os.walk(data_dir):
+                for fn in files:
+                    if fn.lower().endswith(".txt"):
+                        full = os.path.join(r, fn)
+                        try:
+                            rel = os.path.relpath(full, base_root).replace("\\", "/")
+                        except ValueError:
+                            rel = os.path.join("data", os.path.relpath(full, data_dir)).replace("\\", "/")
+                        results.append(rel)
+            results.sort()
+            self._all_files_cache = results
+            self._cache_root = root
+            self.hint.configure(text="{} .txt files found under {} (selected data folder directly)".format(len(results), data_dir))
+            return results
         data_dir = os.path.join(root, "data")
         results = []
         if os.path.isdir(data_dir):
@@ -631,8 +671,17 @@ class FileLinkerPanel(ttk.Frame):
                 for fn in files:
                     if fn.lower().endswith(".txt"):
                         full = os.path.join(r, fn)
-                        rel = os.path.relpath(full, root).replace("\\", "/")
+                        try:
+                            rel = os.path.relpath(full, root).replace("\\", "/")
+                        except ValueError:
+                            continue
                         results.append(rel)
+        else:
+            # hint if data subfolder missing
+            self.hint.configure(text="No 'data' subfolder found under {}. Use File > Set Data Folder...".format(root))
+            self._all_files_cache = []
+            self._cache_root = root
+            return []
         results.sort()
         self._all_files_cache = results
         self._cache_root = root
@@ -642,8 +691,11 @@ class FileLinkerPanel(ttk.Frame):
     def _refresh_available(self):
         query = self.search_var.get().strip().lower()
         self.available_list.delete(0, tk.END)
-        for rel in self._all_files():
-            if rel in self.linked:
+        linked_set = set(self.linked)
+        all_files = self._all_files()
+        # avoid re-fetch inside loop
+        for rel in all_files:
+            if rel in linked_set:
                 continue
             if query and query not in rel.lower():
                 continue
@@ -710,8 +762,16 @@ class EntryEditor(ttk.Frame):
         canvas.bind("<Configure>", on_configure)
 
         def _wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _wheel)
+            # Only scroll editor canvas when event is on canvas
+            # Use canvas binding instead of bind_all to avoid double-scroll
+            try:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind("<MouseWheel>", _wheel)
+        # Linux scroll
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
         pad = dict(padx=10, pady=4)
 
@@ -1090,6 +1150,7 @@ class MainApp(tk.Tk):
 
         self._build_menu()
         self._build_layout()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._try_auto_load()
 
     # ------------------------------------------------------------------
@@ -1115,7 +1176,7 @@ class MainApp(tk.Tk):
         filemenu.add_separator()
         filemenu.add_command(label="Save As...", command=self.save_as)
         filemenu.add_separator()
-        filemenu.add_command(label="Exit", command=self.destroy)
+        filemenu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=filemenu)
 
         editmenu = tk.Menu(menubar, tearoff=0)
@@ -1145,7 +1206,15 @@ class MainApp(tk.Tk):
         self.search_var = tk.StringVar()
         search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=30)
         search_entry.pack(side="left", padx=4)
-        self.search_var.trace_add("write", lambda *a: self.populate_tree())
+        self._search_debounce_id = None
+        def _on_search_change(*a):
+            if self._search_debounce_id:
+                try:
+                    self.after_cancel(self._search_debounce_id)
+                except Exception:
+                    pass
+            self._search_debounce_id = self.after(150, self.populate_tree)
+        self.search_var.trace_add("write", _on_search_change)
 
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -1187,13 +1256,39 @@ class MainApp(tk.Tk):
             "measurement database.\nEntries are never saved over the original "
             "file -- always as a new file.".format(APP_TITLE, APP_VERSION))
 
+    def _on_close(self):
+        if self.dirty:
+            resp = messagebox.askyesnocancel(
+                APP_TITLE,
+                "You have unsaved changes. Save before exiting?\n\nYes = Save As..., No = Exit without saving, Cancel = Stay.")
+            if resp is None:
+                return
+            if resp:
+                self.save_as()
+                # if still dirty after save attempt, stay
+                if self.dirty:
+                    return
+        self.destroy()
+
     # ------------------------------------------------------------------
     # LOADING / SAVING
     # ------------------------------------------------------------------
     def _try_auto_load(self):
-        candidate = os.path.join(script_folder(), "database.json")
-        if os.path.isfile(candidate):
-            self._load_from_path(candidate)
+        # Try multiple candidate locations: next to exe/script, parent folder, cwd
+        candidates = [
+            os.path.join(script_folder(), "database.json"),
+            os.path.join(os.path.dirname(script_folder()), "database.json"),
+            os.path.join(os.getcwd(), "database.json"),
+        ]
+        seen = set()
+        for candidate in candidates:
+            norm = os.path.normpath(candidate)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.isfile(candidate):
+                self._load_from_path(candidate)
+                return
 
     def open_database(self):
         path = filedialog.askopenfilename(
@@ -1209,6 +1304,9 @@ class MainApp(tk.Tk):
         except L.DatabaseLoadError as e:
             messagebox.showerror(APP_TITLE, "Failed to load database:\n\n{}".format(e))
             return
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, "Unexpected error loading database:\n\n{}".format(e))
+            return
         self.entries = entries
         self.db_path = path
         self.data_root = os.path.dirname(os.path.abspath(path))
@@ -1219,11 +1317,21 @@ class MainApp(tk.Tk):
         self.populate_tree()
         msg = "Loaded {} entries from {}".format(len(entries), path)
         if notes:
-            msg += "  ({} entries skipped -- see console)".format(len(notes))
+            msg += "  ({} note(s))".format(len(notes))
             for n in notes:
                 print(n)
+            # show first few notes in dialog
+            preview = "\n".join(notes[:10])
+            if len(notes) > 10:
+                preview += "\n... and {} more (see console)".format(len(notes)-10)
+            messagebox.showwarning(APP_TITLE, "Notes while loading:\n\n" + preview)
         self.status_var.set(msg)
-        issues = L.run_full_audit(self.entries, self.data_root)
+        # run audit (may be heavy) without blocking
+        try:
+            issues = L.run_full_audit(self.entries, self.data_root)
+        except Exception as e:
+            messagebox.showwarning(APP_TITLE, "Audit failed:\n{}".format(e))
+            issues = []
         self.audit_panel.show_issues(issues)
         if issues:
             messagebox.showinfo(
@@ -1235,9 +1343,26 @@ class MainApp(tk.Tk):
         path = filedialog.askdirectory(title="Select the folder that contains the 'data' subfolder")
         if not path:
             return
-        self.data_root = path
+        # Validate: allow either the parent of data/ or data/ itself
+        norm = os.path.normpath(path)
+        base = os.path.basename(norm).lower()
+        data_candidate = os.path.join(path, "data") if base != "data" else path
+        if not os.path.isdir(data_candidate):
+            # try parent case where user selected data folder directly - already handled
+            # otherwise warn
+            if base != "data":
+                resp = messagebox.askyesno(APP_TITLE,
+                    "No 'data' subfolder found under:\n{}\n\nUse this folder anyway?".format(path))
+                if not resp:
+                    return
+        # If user selected .../data, normalize to parent so audit uses parent as root
+        if base == "data":
+            # store parent as data_root so relative paths stay data/...
+            self.data_root = os.path.dirname(norm)
+        else:
+            self.data_root = path
         self.file_panel_root_changed()
-        self.status_var.set("Data folder set to: {}".format(path))
+        self.status_var.set("Data folder set to: {}".format(self.data_root))
 
     def file_panel_root_changed(self):
         self.editor.file_panel.refresh_root_changed()
@@ -1249,7 +1374,11 @@ class MainApp(tk.Tk):
         if not self.entries:
             messagebox.showwarning(APP_TITLE, "Nothing to save -- no database loaded.")
             return
-        issues = L.run_full_audit(self.entries, self.data_root)
+        try:
+            issues = L.run_full_audit(self.entries, self.data_root)
+        except Exception as e:
+            messagebox.showwarning(APP_TITLE, "Audit failed before save:\n{}".format(e))
+            issues = []
         blocking = [i for i in issues if i.severity == "error"]
         dup_ids = {}
         for idx, e in enumerate(self.entries):
@@ -1276,16 +1405,44 @@ class MainApp(tk.Tk):
             initialdir=self.data_root or ".")
         if not path:
             return
-        if self.db_path and os.path.abspath(path) == os.path.abspath(self.db_path):
+        # case-insensitive compare on Windows, normalize path
+        if self.db_path and os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(self.db_path)):
             messagebox.showerror(
                 APP_TITLE,
                 "For safety, you cannot overwrite the original database file.\n"
                 "Please choose a different file name.")
             return
-        ordered = L.save_database(path, self.entries)
+        try:
+            # Remember currently edited id to restore selection after sort
+            current_id = None
+            if self.editing_index is not None and 0 <= self.editing_index < len(self.entries):
+                current_id = self.entries[self.editing_index].get("id")
+            ordered = L.save_database(path, self.entries)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
+            return
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, "Unexpected error while saving:\n{}".format(e))
+            return
         self.entries = ordered
         self.dirty = False
+        # re-map editing_index to new sorted position
+        if current_id:
+            for i, e in enumerate(self.entries):
+                if e.get("id") == current_id:
+                    self.editing_index = i
+                    break
+            else:
+                self.editing_index = None
         self.populate_tree()
+        # re-select after sort
+        if self.editing_index is not None:
+            iid = "entry:{}".format(self.editing_index)
+            try:
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+            except Exception:
+                pass
         self.status_var.set("Saved {} entries to {}".format(len(ordered), path))
         messagebox.showinfo(APP_TITLE, "Saved as:\n{}".format(path))
 
@@ -1381,9 +1538,30 @@ class MainApp(tk.Tk):
         if not self.entries:
             messagebox.showinfo(APP_TITLE, "No database loaded.")
             return
-        issues = L.run_full_audit(self.entries, self.data_root)
-        self.audit_panel.show_issues(issues)
+        # For small DBs run synchronously to keep simple; for large DBs use thread
+        # Threshold ~2000 entries or when data_root has many files
+        if len(self.entries) < 5000 and not self.data_root:
+            issues = L.run_full_audit(self.entries, self.data_root)
+            self.audit_panel.show_issues(issues)
+            self.notebook.select(self.audit_panel)
+            return
+        # threaded audit to avoid freezing UI
+        self.status_var.set("Running audit...")
         self.notebook.select(self.audit_panel)
+        def _do():
+            try:
+                issues = L.run_full_audit(self.entries, self.data_root)
+            except Exception as e:
+                issues = []
+                err_msg = str(e)
+                def _err():
+                    messagebox.showwarning(APP_TITLE, "Audit failed:\n{}".format(err_msg))
+                self.after(0, _err)
+            def _done():
+                self.audit_panel.show_issues(issues)
+                self.status_var.set("Audit complete: {} issues".format(len(issues)))
+            self.after(0, _done)
+        threading.Thread(target=_do, daemon=True).start()
 
     def apply_fixes(self, issues):
         for issue in issues:
