@@ -46,20 +46,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GitHub's default `python3` on macOS runners doesn't reliably
-      # include tkinter. python-tk@3.12 pulls in a matching python@3.12
-      # with Tk support and installs both keg-only into
-      # /opt/homebrew/opt/python@3.12/bin (Apple Silicon runners) --
-      # add that to PATH so `python3.12` resolves to the Tk-enabled build.
       - name: Install Python with Tk via Homebrew
         run: |
           brew install python-tk@3.12
           echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
 
-      # Added --break-system-packages here to bypass Homebrew's PEP 668 restriction
+      # Removed `--upgrade pip` so it installs pyinstaller without trying to overwrite Homebrew's pip
       - name: Install PyInstaller and create-dmg
         run: |
-          python3.12 -m pip install --upgrade pip pyinstaller --break-system-packages
+          python3.12 -m pip install pyinstaller --break-system-packages
           brew install create-dmg
 
       - name: Verify tkinter is available
