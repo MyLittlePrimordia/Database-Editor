@@ -186,6 +186,20 @@ def price_tier_for(price_usd):
     return "Budget"
 
 
+# --------------------------------------------------------------------------
+# MODEL / VARIANT NAMING -- intentionally NOT audited automatically.
+# Real-data auditing proved token-based splitting and Arabic->Roman
+# conversion corrupt valid entries:
+#   - 'Pro'/'Bass'/colors are part of official names (Koss Porta Pro,
+#     Sennheiser HD 280 Pro, Beats Fit Pro) with no base model existing
+#   - trailing numbers are often driver counts (Simgot SuperMix 4,
+#     LETSHUOER Cadenza 4), concurrent price tiers (Jabra Elite 3/4/5),
+#     or official OEM styling (Apple AirPods 4, Truthear Zero 2)
+# Product-identity checks stay in the manual LLM audit workflow
+# (AUDIT DATABASE PROMPT.txt) where multi-source verification is possible.
+# --------------------------------------------------------------------------
+
+
 def round_price_to_5(price_usd):
     """Round to nearest $5 using half-up (2.5 -> 5, not bankers)."""
     try:
@@ -509,7 +523,6 @@ def describe_entry_change(before, after, max_fields=3):
             break
     return "; ".join(parts)
 
-
 # --------------------------------------------------------------------------
 # LOAD / SAVE
 # --------------------------------------------------------------------------
@@ -684,6 +697,7 @@ def run_full_audit(entries, data_root=None):
     """
     issues = []
     seen_ids = {}
+    disk_index = None   # lowercase path -> on-disk spelling (for casing audit)
 
     # Pre-compute file index once if data_root provided (single walk)
     on_disk_set = None
@@ -710,6 +724,7 @@ def run_full_audit(entries, data_root=None):
                         rel = re.sub(r"/+", "/", rel)
                         on_disk.append(rel)
             on_disk_set = set(on_disk)
+            disk_index = {p.lower(): p for p in on_disk}
 
     # ---- per-entry checks -------------------------------------------------
     for idx, entry in enumerate(entries):
@@ -881,6 +896,81 @@ def run_full_audit(entries, data_root=None):
                     "(got {}/{}).".format(imp_val, sen_val),
                     fix=make_tws_fix(),
                     severity="error",
+                ))
+
+        # ---- impedance / sensitivity sanity ------------------------------
+        # prompts: whole integers only; 0 when unverifiable. Existing entries
+        # were only guarded at save-time until now.
+        for field, label in (("impedance", "Impedance"), ("sensitivity", "Sensitivity")):
+            raw = entry.get(field, 0)
+            try:
+                fv = float(raw)
+            except (TypeError, ValueError):
+                def make_bad_spec_fix(i=idx, f=field):
+                    def fix(entries_list):
+                        entries_list[i][f] = 0
+                    return fix
+                issues.append(AuditIssue(
+                    "Spec Sanity", idx, eid,
+                    "{} '{}' is not a number (reset to 0).".format(label, raw),
+                    fix=make_bad_spec_fix(),
+                    severity="error",
+                ))
+                continue
+            if fv < 0:
+                def make_neg_fix(i=idx, f=field):
+                    def fix(entries_list):
+                        entries_list[i][f] = 0
+                    return fix
+                issues.append(AuditIssue(
+                    "Spec Sanity", idx, eid,
+                    "{} {} is negative (reset to 0).".format(label, raw),
+                    fix=make_neg_fix(),
+                    severity="error",
+                ))
+            elif fv != int(fv):
+                rounded = int(math.floor(fv + 0.5))   # half-up, like price rounding
+
+                def make_round_fix(i=idx, f=field, val=rounded):
+                    def fix(entries_list):
+                        entries_list[i][f] = int(val)
+                    return fix
+                issues.append(AuditIssue(
+                    "Spec Sanity", idx, eid,
+                    "{} must be a whole integer ({:.1f} -> {}).".format(
+                        label, fv, rounded),
+                    fix=make_round_fix(),
+                    severity="warning",
+                ))
+
+        # ---- file path casing vs disk -------------------------------------
+        # prompts demand exact path preservation; case-insensitive matches
+        # silently work on Windows but break Linux builds of the main app.
+        files = entry.get("files", []) or []
+        if disk_index:
+            fixed_paths = []
+            changed_casing = False
+            for pos, rel in enumerate(files):
+                actual = disk_index.get(rel.lower()) if isinstance(rel, str) else None
+                if actual and actual != rel:
+                    fixed_paths.append((pos, actual))
+                    changed_casing = True
+            if changed_casing:
+
+                def make_case_fix(i=idx, updates=tuple(fixed_paths)):
+                    def fix(entries_list):
+                        lst = entries_list[i].get("files", [])
+                        for pos, actual in updates:
+                            if 0 <= pos < len(lst) and lst[pos].lower() == actual.lower():
+                                lst[pos] = actual
+                    return fix
+                shown = ", ".join("'{}'->'{}'".format(o, a) for o, a in fixed_paths[:2])
+                issues.append(AuditIssue(
+                    "Path Casing", idx, eid,
+                    "File path casing differs from disk: {}. Auto-fix restores "
+                    "the on-disk spelling.".format(shown),
+                    fix=make_case_fix(),
+                    severity="warning",
                 ))
 
         # price tier tag correction
