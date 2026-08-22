@@ -75,6 +75,10 @@ FORM_CONNECTOR_MAP = {
     "Over-Ear Headphones (Wired)": ["Detachable Cable", "Fixed Cable", "Electrostatic"],
 }
 
+# TWS earbuds have no wired out path (no DAC/amp chain), so impedance and
+# sensitivity are meaningless and must always be recorded as 0.
+TWS_FORM_FACTOR = "Wireless Earbuds (TWS)"
+
 # icon keys used by the GUI for each form factor / connector / driver tech
 FORM_FACTOR_ICON = {
     "IEM": "iem",
@@ -339,6 +343,18 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
             "Connector '{}' is not valid for form factor '{}'.".format(connector, form_factor)
         )
 
+    if form_factor == TWS_FORM_FACTOR:
+        for f, label in (("impedance", "Impedance"), ("sensitivity", "Sensitivity")):
+            try:
+                v = int(float(entry.get(f, 0) or 0))
+            except (TypeError, ValueError):
+                v = -1
+            if v != 0:
+                errors.append(
+                    "{} entries must have {} set to 0 (wireless: no DAC/amp chain).".format(
+                        TWS_FORM_FACTOR, label)
+                )
+
     driver_type = (entry.get("driver_type") or "").strip()
     driver_config = (entry.get("driver_config") or "").strip()
     if driver_type and driver_type not in ALLOWED_DRIVER_TYPES:
@@ -451,6 +467,49 @@ def sort_key(entry):
     )
 
 
+def describe_entry_change(before, after, max_fields=3):
+    """Human-readable summary of the field-level differences between two
+    versions of one entry, e.g.
+    "Brand: '7HZ' -> '7Hz'; Price: $20 -> $25 (+2 more)".
+    The 'id' field is excluded (it appears in the entry title anyway).
+    """
+    if before is None and after is None:
+        return ""
+    if before is None:
+        return "created"
+    if after is None:
+        return "removed"
+    parts = []
+    for f in SCHEMA_FIELDS:
+        if f == "id":
+            continue
+        b, a = before.get(f), after.get(f)
+        if b == a:
+            continue
+        b = b if isinstance(b, list) else b
+        if isinstance(b, list) or isinstance(a, list):
+            parts.append("{}: {} -> {} item(s)".format(
+                f.capitalize(), len(b or []), len(a or [])))
+        elif f == "price_usd":
+            try:
+                parts.append("Price: ${} -> ${}".format(int(b), int(a)))
+            except (TypeError, ValueError):
+                parts.append("Price: {} -> {}".format(b, a))
+        elif f in SCHEMA_INT_FIELDS:
+            parts.append("{}: {} -> {}".format(f.capitalize(), b, a))
+        else:
+            parts.append("{}: '{}' -> '{}'".format(f.capitalize(), b, a))
+        if len(parts) >= max_fields:
+            remaining = sum(
+                1 for g in SCHEMA_FIELDS
+                if g not in ("id",) and SCHEMA_FIELDS.index(g) > SCHEMA_FIELDS.index(f)
+                and before.get(g) != after.get(g))
+            if remaining:
+                parts.append("(+{} more)".format(remaining))
+            break
+    return "; ".join(parts)
+
+
 # --------------------------------------------------------------------------
 # LOAD / SAVE
 # --------------------------------------------------------------------------
@@ -499,14 +558,105 @@ def load_database(path):
 
 
 def save_database(path, entries):
-    ordered = sorted((build_clean_entry(e) for e in entries), key=sort_key)
+    """Sort `entries` IN PLACE (preserving entry object identities, which
+    the undo history relies on), then write a canonicalized copy of them.
+    Returns `entries` (same objects, newly sorted)."""
+    entries.sort(key=sort_key)
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+    ordered = [build_clean_entry(e) for e in entries]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(ordered, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    return ordered
+    return entries
+
+
+# --------------------------------------------------------------------------
+# AUTOSAVE BACKUPS
+# --------------------------------------------------------------------------
+AUTOSAVE_DIR_NAME = ".db_editor_backups"
+AUTOSAVE_PREFIX = "autosave_"
+AUTOSAVE_KEEP = 15          # newest N snapshots are kept, older pruned
+AUTOSAVE_SEEN_MARKER = ".autosave_seen"
+
+
+def backup_dir_for(db_path):
+    """Backups live in a hidden folder next to the database itself."""
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), AUTOSAVE_DIR_NAME)
+
+
+def _list_autosave_files(bdir):
+    if not os.path.isdir(bdir):
+        return []
+    out = []
+    for fn in os.listdir(bdir):
+        if fn.startswith(AUTOSAVE_PREFIX) and fn.endswith(".json"):
+            p = os.path.join(bdir, fn)
+            if os.path.isfile(p):
+                out.append(p)
+    out.sort()  # timestamp is embedded in the name -> lexicographic == chronological
+    return out
+
+
+def write_autosave(db_path, entries, keep=AUTOSAVE_KEEP):
+    """Write a timestamped full snapshot of `entries` next to the database
+    file and prune older snapshots. Returns the path written.
+    The snapshot uses the same canonical format as Save As..., so any
+    backup file is directly loadable/usable on its own."""
+    bdir = backup_dir_for(db_path)
+    os.makedirs(bdir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(bdir, "{}{}.json".format(AUTOSAVE_PREFIX, stamp))
+    n = 1
+    while os.path.exists(path):     # two saves inside the same second
+        n += 1
+        path = os.path.join(bdir, "{}{}_{}.json".format(AUTOSAVE_PREFIX, stamp, n))
+    save_database(path, entries)
+    backups = _list_autosave_files(bdir)
+    for old in backups[:-keep] if len(backups) > keep else []:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return path
+
+
+def latest_autosave(db_path):
+    files = _list_autosave_files(backup_dir_for(db_path))
+    return files[-1] if files else None
+
+
+def autosave_seen_marker_path(db_path):
+    return os.path.join(backup_dir_for(db_path), AUTOSAVE_SEEN_MARKER)
+
+
+def mark_autosave_seen(db_path, backup_file=None):
+    """Record which snapshot the user has already been reminded about so
+    the crash-recovery prompt only fires when a NEW one exists."""
+    if backup_file is None:
+        backup_file = latest_autosave(db_path) or ""
+    try:
+        with open(autosave_seen_marker_path(db_path), "w", encoding="utf-8") as f:
+            f.write(os.path.basename(backup_file or ""))
+    except OSError:
+        pass
+
+
+def unseen_autosave(db_path):
+    """Newest autosave that was never shown to the user at a session start
+    (= crash-recovery candidate). None when nothing new exists."""
+    latest = latest_autosave(db_path)
+    if not latest:
+        return None
+    try:
+        with open(autosave_seen_marker_path(db_path), "r", encoding="utf-8") as f:
+            seen = f.read().strip()
+    except OSError:
+        seen = ""
+    if seen == os.path.basename(latest):
+        return None
+    return latest
 
 
 # --------------------------------------------------------------------------
@@ -708,6 +858,30 @@ def run_full_audit(entries, data_root=None):
                     conn, ff, ", ".join(FORM_CONNECTOR_MAP[ff])),
                 severity="error",
             ))
+
+        # TWS spec zeroing: impedance/sensitivity are meaningless for
+        # Bluetooth-only earbuds (no DAC/amp chain) and must be 0.
+        if ff == TWS_FORM_FACTOR:
+            def _spec_int(field):
+                try:
+                    return int(float(entry.get(field, 0) or 0))
+                except (TypeError, ValueError):
+                    return -1
+            imp_val = _spec_int("impedance")
+            sen_val = _spec_int("sensitivity")
+            if imp_val != 0 or sen_val != 0:
+                def make_tws_fix(i=idx):
+                    def fix(entries_list):
+                        entries_list[i]["impedance"] = 0
+                        entries_list[i]["sensitivity"] = 0
+                    return fix
+                issues.append(AuditIssue(
+                    "TWS Specs", idx, eid,
+                    "TWS entries must have impedance/sensitivity = 0 "
+                    "(got {}/{}).".format(imp_val, sen_val),
+                    fix=make_tws_fix(),
+                    severity="error",
+                ))
 
         # price tier tag correction
         price = entry.get("price_usd", 0)
